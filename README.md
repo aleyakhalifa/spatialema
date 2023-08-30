@@ -1,2 +1,3 @@
 # spatialema
-Spatial analysis of an ecological momentary assessment study
+This repo includes R code of a spatial analysis of an ecological momentary assessment study conducted in Rakai, Uganda. Data from the study are available upon request to the Rakai Health Sciences Program (RHSP) (email: datarequests@rhsp.org).
+
