@@ -1,35 +1,114 @@
 # Load packages----
-library(readxl) # Importing/exporting excel
-library(haven) # Importing stata
-library(data.table) # Formatting data tables
-library(lubridate) # Formatting time variables
+library(readxl)
+library(haven)
+library(data.table)
+library(lubridate)
 library(tidyverse) #for data cleaning and formatting
 library(sf) #for spatial data management and functions
-library(ggmap) # Visualizing on a mapn
-library(epitab) # Descriptive statistics
-library(gtsummary) # Descriptive statistics
-library(leaflet) # Visualizing on a map
-library(leaflegend) # Visualizing on a map
-library(sp) # Spatial data
+library(ggmap) #for visualization
+library(epitab)
+library(gtsummary)
+library(leaflet)
+library(leaflegend)
+library(sp)
 library(spdep) # Spatial Dependence: Weighting Schemes, Statistics and Models
-library(spatstat) # Spatial statistics
+library(spatstat)
 library(splancs) # K-function
 library(smacpod) # Spatial scanning statistic 
-library(mapview) # Visualizing on a map
+library(mapview)
+
 
 # Load data----
-survey <- readRDS("survey.rds") # RCCS survey data
-emai_behavior <- readRDS(file="emai_behavior.rds") # EMAI trial reported behaviors
-emai_gps <- readRDS("emai_gps.rds") # EMAI trial GPS data
+
+#RCCS survey data including R19 data + R18-17 for missing participants
+survey <- read_excel("survey_230125.xlsx")
+survey <- survey %>% filter(emai_id!="EM17")
+saveRDS(survey, file = "survey.rds")
+
+#SES quartiles estimated separately, by round
+SES_data <- rbind(read_dta("SES_data.dta"),read_dta("SES_data_R17.dta"))
+saveRDS(SES_data, file = "SES_data.rds")
+
+#Trial outcome data
+emai_outcome <- read.csv(file="EMAI_Outcome_18March2021v2.csv")
+emai_outcome <- emai_outcome %>% 
+  rename(EMAI_ID = patient_code) 
+emai_group <- emai_outcome %>% 
+  select(EMAI_ID, Group)
+emai_group <- emai_group %>% 
+  distinct(EMAI_ID, Group)
+
+#Store start and end dates for each participant
+emai_dates <- emai_outcome %>% select(EMAI_ID,Start_date)
+emai_dates$start <- as.POSIXlt(emai_dates$Start_date, format = "%m / %d / %y", tz="Africa/Kampala")
+emai_dates$end <- emai_dates$start + days(90)
+#de-duplicate
+emai_dates <- distinct(emai_dates)
+
+#Reported behaviors
+emai_behavior <- read.csv(file="eventcontingent.csv")
+emai_behavior <- emai_behavior %>% 
+  rename(EMAI_ID = patient_code) 
+emai_behavior$EMAI_ID <- gsub("AI-0","",as.character(emai_behavior$EMAI_ID))
+emai_behavior$EMAI_ID <- gsub("-","",as.character(emai_behavior$EMAI_ID))
+emai_behavior$EMAI_ID <- gsub("_","",as.character(emai_behavior$EMAI_ID))
+emai_behavior$EMAI_ID <- gsub("EM10A","EM10",as.character(emai_behavior$EMAI_ID))
+emai_behavior <- filter(emai_behavior, grepl('EM',EMAI_ID))
+  #Truncate to start and end dates by participant
+  emai_behavior <- emai_behavior %>% mutate(timestamp = str_replace(meta.end,"T"," ")) 
+  emai_behavior$timestamp <- as.POSIXlt(emai_behavior$timestamp, tz="Africa/Kampala")
+  ### Merge with emai_dates
+  emai_behavior <- inner_join(emai_dates,emai_behavior,by="EMAI_ID")
+  ### Keep all rows where timestamp > (start - days(1)) & timestamp < (end + days(1))
+  emai_behavior <- emai_behavior %>%
+    filter((timestamp > (start)) & (timestamp < (end + days(1))))
+saveRDS(emai_behavior, file = "emai_behavior.rds")
 
 #-------------------------------------------------------------------------#
 
 # Part I. Describe mobility----
-## Create spatial objects----
+## Set up data----
+# Load data
+emai_gps <- read.csv(file="emai_gps.csv") %>% filter(EMAI_ID!="EM17")
+
+
+## Exclusions/data cleaning
+### Drop locations without coordinates or timestamps
+emai_gps <- emai_gps[!(is.na(emai_gps$gps_lat)), ]
+emai_gps <- emai_gps[!(is.na(emai_gps$timestamp)), ]
+### Remove duplicate points
+emai_gps <- distinct(emai_gps,EMAI_ID,timestamp,.keep_all=TRUE)
+### Study area boundary
+## Remove implausible distances (where at least one GPS point is outside of the plausible boundary)
+#left=29.5, bottom=-1.4 , right=34.0 , top=0.7
+emai_gps <- emai_gps %>% filter(gps_lat>-1.4 & gps_lat<0.7 & gps_long>29.5 & gps_long<34.0)
+#remove IDs without RCCS data
+emai_gps <- emai_gps %>% filter(EMAI_ID!="EM25" & EMAI_ID!="EM53"& EMAI_ID!="EM17")
+
+## Convert time
+### Merge with emai_dates
+emai_gps <- inner_join(emai_dates,emai_gps,by="EMAI_ID")
+### Format timestamps & start/end dates
+emai_gps$timestamp <- as.POSIXlt(emai_gps$timestamp, format = "%d / %m / %Y %H:%M", tz="Africa/Kampala")
+### Keep all rows where timestamp > (start - days(1)) & timestamp < (end + days(1))
+emai_gps <- emai_gps %>%
+  filter((timestamp > (start)) & (timestamp < (end + days(1))))
+### Create weeks
+emai_gps <- emai_gps %>%
+  group_by(EMAI_ID) %>% 
+  mutate(week = week(timestamp))
+
+saveRDS(emai_gps, file = "emai_gps.rds")
+
+## Create spatial objects
+#Convert lat and long to simple feature (sf) points
 gps <- st_as_sf(emai_gps, coords=c('gps_long','gps_lat'),
-                crs=4326) # convert lat and long to simple feature (sf) points
-gps$geometry # check
- 
+                crs=4326)
+#check
+gps$geometry
+
+
+
 ## 1. Weekly distance----
 #sort by timestamp
 gps_week <- gps %>% arrange(EMAI_ID, timestamp)
@@ -178,7 +257,10 @@ summary(buffer_points$contains_na_800)
 #### Merge data----
 #Merge with survey data
 df_list <- list(survey, gps_weekly)
-rccs_dist <- df_list %>% reduce(full_join,by='RCCS_ID') %>% rename(EMAI_ID=EMAI_ID.x)
+rccs_dist <- df_list %>% reduce(full_join,by='RCCS_ID')
+#filter out EM17 because they don't have gps data
+#also note, three participants with EMAI_ID.y's were not matched to a survey.
+rccs_dist <- rccs_dist %>% rename(EMAI_ID=EMAI_ID.x) %>% filter(EMAI_ID!="EM17")
 
 #Merge with SES data
 SES_data$curr_id <- as.character(SES_data$curr_id)
@@ -685,6 +767,7 @@ fig1 <- leaflet(data=emai_gps,options = leafletOptions(zoomControl = FALSE)) %>%
   addScaleBar(position = "bottomleft", options=scaleBarOptions(metric=TRUE,imperial=FALSE)) 
 fig1
 savePlot(fig1,filename="fig1.png",type="png")
+
 #### Table 1. Sociodemographic characteristics----
 table <- data %>% select(sex,age_group,rSEScat,education,resident,mobility,comm_type,occupation,hiv,motor,bicycle)
 table1 <- table %>% tbl_summary()
@@ -693,91 +776,26 @@ table1 %>%
   as_tibble() %>% 
   write.xlsx("Table1.xlsx")
 
-#### Table 2. Mobility measures----
-#merge gps_weekly, total_gps_points, clustered_gps_points, locations_weekly, buffer_points, num_reports, num_reports_week
-table <- data
 
-#### Figure 2. Mobility by sociodemographics----
-#Create the boxplot data (filter out outlier for visualization purposes)
-iqr <- data %>% select(mean_distance,sex,age_group,rSEScat,education,resident,mobility,comm_type,occupation,hiv,motor,bicycle)
-iqr$mean_distance <- as.numeric(iqr$mean_distance)
+#### Description of the data----
+## Number observation days
+emai_gps %>% 
+  select(EMAI_ID, timestamp) %>% 
+  mutate(date = as.Date(timestamp)) %>%
+  select(-timestamp) %>% 
+  unique() %>% 
+  group_by(EMAI_ID) %>% 
+  summarize(n = n()) %>% 
+  summary(n)
 
-#iqr and p-value by category
-iqr %>% tbl_continuous(variable=mean_distance,
-                       include=c(sex,age_group,rSEScat,education,resident,mobility,comm_type,occupation,hiv,motor,bicycle)) %>%
-  add_p(everything() ~ "kruskal.test", pvalue_fun = ~style_pvalue(.x, digits = 2)) 
+## Number points per day
+emai_gps %>% 
+  select(EMAI_ID, timestamp) %>% 
+  mutate(date = as.Date(timestamp)) %>%
+  group_by(EMAI_ID, date) %>% 
+  summarize(n = n()) %>% 
+  group_by(EMAI_ID) %>% 
+  summarize(pts_per_day = mean(n)) %>%
+  summary(pts_per_day)
 
-#n's by category
-iqr %>% tbl_summary()
-
-#pivot longer
-iqr_long <- iqr %>%  pivot_longer(-mean_distance)
-write.xlsx(iqr_long, "iqr_long.xlsx")
-
-#Plot the boxplot
-#load data
-boxplots <- read_excel("boxplots_230206.xlsx", sheet=2)
-
-boxplots <- boxplots %>% filter(!is.na(value)) 
-boxplots <- boxplots %>% filter(value!="N/A")
-
-#order variables to match Table 1
-boxplots$Variables <- factor(boxplots$Variables,
-                             levels=c("Total","Gender (P = 0.37)",
-                                      "Age group (P = 0.23)","Socioeconomic status quartile (P = 0.17)",
-                                      "Highest level of education (P = 0.55)","Primary occupation (P = 0.81)",
-                                      "HIV Status (P = 0.66)","Resident status (P = 0.39)","Reported migration (P = 0.93)",
-                                      "Type of community (P = 0.15)",
-                                      "Access to car or motorcycle (P = 0.15)","Access to a bicycle (P = 0.41)"),
-                             ordered=TRUE)
-boxplots$Values2 <- factor(boxplots$Values2,
-                           levels=c("No (n = 26), IQR: 208 (111, 580)", "Yes (n = 19), IQR: 355 (182, 499)", 
-                                    "No (n = 28), IQR: 215 (118, 452)", "Yes (n = 17), IQR: 355 (192, 588)", 
-                                    "Trading (n = 19), IQR: 385 (202, 576)", "Fishing (n = 5), IQR: 203 (151, 230)", "Agrarian (n = 21), IQR: 172 (92, 553)", 
-                                    "In-migrated (n = 2), IQR: 369 (230, 507)", "Out-migrated (n = 7), IQR: 230 (170, 400)", "No migration (n = 36), IQR: 302 (145, 571)", 
-                                    "Transient (n = 1), IQR: 92 (92, 92)", "Former resident (out-migrated) (n = 6), IQR: 208 (162, 381)", "Permanent (n = 38), IQR: 338 (150, 580)", 
-                                    "HIV positive (n = 5), IQR: 230 (203, 513)", "HIV negative (n = 40), IQR: 302 (127, 556)", 
-                                    "Other (n = 5), IQR: 151 (121, 203)", "Student (n = 1), IQR: 274 (274, 274)", "Retail/trading/vending (n = 7), IQR: 485 (153, 871)", "Government/clerical/teaching (n = 12), IQR: 261 (167, 417)", "Construction/transportation (n = 2), IQR: 387 (258, 517)", "Agriculture (n = 14), IQR: 370 (96, 553)", 
-                                    "Tertiary (n = 12), IQR: 189 (153, 400)", "Secondary (n = 33), IQR: 355 (129, 553)", 
-                                    "Highest (n = 15), IQR: 212 (172, 519)", "High-middle (n = 17), IQR: 345 (151, 588)", "Low-middle (n = 6), IQR: 539 (334, 616)", "Lowest (n = 7), IQR: 129 (57, 300)", 
-                                    "35-45 (n = 15), IQR: 331 (198, 549)", "25-34 (n = 16), IQR: 408 (127, 578)", "20-24 (n = 14), IQR: 199 (81, 366)", 
-                                    "Women (n = 21), IQR: 369 (172, 588)", "Men (n = 24), IQR: 221 (145, 415)", 
-                                    "N = 45, IQR: 274 (150, 533)"),
-                           ordered=TRUE)
-
-ggplot(data=boxplots, aes(x=Values2, y=mean_distance, color=as.character(Variables))) + 
-  geom_boxplot() + 
-  coord_flip() +
-  ylab("Distribution of weekly distance (km) traveled")  + 
-  scale_y_continuous(breaks=c(0,250,500,750,1000,1250,1500),limits=c(0,1500)) +
-  facet_wrap(~Variables,labeller=labeller(Variables=label_wrap_gen(width=20)),strip.position="left",nrow=12,ncol=1,scales = "free_y") +
-  theme_linedraw() +
-  theme_grey() + 
-  theme(legend.position = "none",
-        axis.title.y=element_blank(),
-        strip.text.y.left = element_text(angle=0),
-        strip.placement = "outside")
-
-#### Supplement, Figure 1. Travel paths over the study period, by participants----
-emai_gps_supfig <- emai_gps
-emai_gps_supfig$EMAI_ID <- as.numeric(as.factor(emai_gps_supfig$EMAI_ID))
-
-base <- get_stamenmap(bbox=c(left=29.5, bottom=-1.4 , right=34.0 , top=0.7), zoom=8, "terrain-lines")
-
-supfig1 <- ggmap(base) + 
-  geom_point(data=emai_gps_supfig, aes(x = gps_long, y = gps_lat, colour="red"), size=1) +
-  facet_wrap(~EMAI_ID) + 
-  xlab("") + 
-  ylab("") +
-  theme(legend.position="none",
-        axis.text.x=element_blank(), 
-        axis.ticks.x=element_blank(), 
-        axis.text.y=element_blank(),  
-        axis.ticks.y=element_blank(),
-        panel.grid.major = element_blank(), 
-        panel.grid.minor = element_blank(),
-        panel.background = element_blank(),
-        strip.text.x = element_text(size = 20))
-supfig1
-ggsave("maps_by_id.pdf", plot = supfig1, width = 24, height = 24, units = "in")
 
